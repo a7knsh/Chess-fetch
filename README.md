@@ -7,7 +7,7 @@
 </pre>
 
 
-# ♞ chess — game review in your terminal
+# ♞ chess - game review in your terminal
 
 A pure-Bash CLI that pulls your recent games from **Chess.com** or **Lichess**, lets you pick one with `fzf`, and shows a Game Review: accuracy, average centipawn loss, inaccuracies / mistakes / blunders, key moments with the engine's better move, an eval sparkline, a full move list, and a step-through board.
 
