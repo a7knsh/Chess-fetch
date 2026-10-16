@@ -1,3 +1,9 @@
+  ____ _   _ _____ ____ ____        _____ _____ _____ ____ _   _ 
+ / ___| | | | ____/ ___/ ___|      |  ___| ____|_   _/ ___| | | |
+| |   | |_| |  _| \___ \___ \ _____| |_  |  _|   | || |   | |_| |
+| |___|  _  | |___ ___) |__) |_____|  _| | |___  | || |___|  _  |
+ \____|_| |_|_____|____/____/      |_|   |_____| |_| \____|_| |_|
+                                                                 
 # ♞ chess — game review in your terminal
 
 A pure-Bash CLI that pulls your recent games from **Chess.com** or **Lichess**, lets you pick one with `fzf`, and shows a Game Review: accuracy, average centipawn loss, inaccuracies / mistakes / blunders, key moments with the engine's better move, an eval sparkline, a full move list, and a step-through board.
