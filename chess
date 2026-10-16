@@ -1,0 +1,1245 @@
+#!/usr/bin/env bash
+# ─────────────────────────────────────────────────────────────────────────────
+#  chess — terminal game review for Chess.com & Lichess
+#  Pure Bash. Needs: curl, jq, fzf.  Optional: stockfish (engine analysis), less.
+# ─────────────────────────────────────────────────────────────────────────────
+set -o pipefail
+shopt -s extglob
+
+readonly VERSION="1.0.0"
+readonly CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/chess-cli"
+readonly CONFIG_FILE="$CONFIG_DIR/config"
+readonly CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/chess-cli"
+readonly UA="chess-cli/$VERSION (bash; +https://github.com/)"
+readonly STARTFEN="rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+SELF="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "$0")"
+
+# ─── colours ────────────────────────────────────────────────────────────────
+setup_colors() {
+  if [[ ( -t 1 || -n ${CHESS_FORCE_COLOR:-} ) && -z ${NO_COLOR:-} ]]; then
+    R=$'\e[0m' BOLD=$'\e[1m' DIM=$'\e[2m' ITAL=$'\e[3m' REV=$'\e[7m'
+    RED=$'\e[38;5;203m' GREEN=$'\e[38;5;114m' YELLOW=$'\e[38;5;221m'
+    ORANGE=$'\e[38;5;209m' BLUE=$'\e[38;5;111m' CYAN=$'\e[38;5;117m'
+    GREY=$'\e[38;5;244m' WHITE=$'\e[38;5;255m' MAG=$'\e[38;5;176m'
+  else
+    R='' BOLD='' DIM='' ITAL='' REV='' RED='' GREEN='' YELLOW='' ORANGE=''
+    BLUE='' CYAN='' GREY='' WHITE='' MAG=''
+  fi
+}
+setup_colors
+
+msg()  { printf '%s\n' "$*" >&2; }
+info() { printf '  %s›%s %s\n' "$CYAN" "$R" "$*" >&2; }
+ok()   { printf '  %s✔%s %s\n' "$GREEN" "$R" "$*" >&2; }
+warn() { printf '  %s!%s %s\n' "$YELLOW" "$R" "$*" >&2; }
+die()  { printf '  %s✖%s %s\n' "$RED" "$R" "$*" >&2; exit 1; }
+
+need() {
+  local c missing=()
+  for c in "$@"; do command -v "$c" >/dev/null 2>&1 || missing+=("$c"); done
+  ((${#missing[@]} == 0)) && return 0
+  die "Missing dependency: ${missing[*]}  (e.g. sudo apt install ${missing[*]})"
+}
+
+term_cols() { local c; c=$(tput cols 2>/dev/null) || c=${COLUMNS:-80}; ((c < 40)) && c=80; printf '%s' "$c"; }
+
+rule() { local w=${1:-60} s; printf -v s '%*s' "$w" ''; printf '%s%s%s\n' "$GREY" "${s// /─}" "$R"; }
+
+# ─── config ─────────────────────────────────────────────────────────────────
+cfg_get() {
+  [[ -f $CONFIG_FILE ]] || return 1
+  local k v
+  while IFS='=' read -r k v || [[ -n $k ]]; do
+    [[ $k == "$1" ]] && { printf '%s' "$v"; return 0; }
+  done <"$CONFIG_FILE"
+  return 1
+}
+
+load_config() {
+  PLATFORM=$(cfg_get platform) || PLATFORM=""
+  USERNAME=$(cfg_get username) || USERNAME=""
+  DEPTH=$(cfg_get depth)       || DEPTH=14
+  NGAMES=$(cfg_get games)      || NGAMES=30
+  THREADS=$(cfg_get threads)   || THREADS=2
+  PIECES=$(cfg_get pieces)     || PIECES=unicode
+  ENGINE=$(cfg_get engine)     || ENGINE=""
+  [[ $DEPTH =~ ^[0-9]+$ ]]   || DEPTH=14
+  [[ $NGAMES =~ ^[0-9]+$ ]]  || NGAMES=30
+  [[ $THREADS =~ ^[0-9]+$ ]] || THREADS=2
+  [[ -n ${CHESS_ASCII:-} ]] && PIECES=ascii
+  if [[ -z $ENGINE ]]; then
+    ENGINE=$(command -v stockfish 2>/dev/null) || { [[ -x /usr/games/stockfish ]] && ENGINE=/usr/games/stockfish; }
+  fi
+}
+
+save_config() {
+  mkdir -p "$CONFIG_DIR" || die "Cannot create $CONFIG_DIR"
+  local tmp="$CONFIG_FILE.tmp.$$" eng
+  eng=$(cfg_get engine) || eng=""
+  {
+    printf '# chess-cli configuration — edit freely\n'
+    printf 'platform=%s\nusername=%s\n' "$PLATFORM" "$USERNAME"
+    printf 'games=%s\ndepth=%s\nthreads=%s\npieces=%s\n' "$NGAMES" "$DEPTH" "$THREADS" "$PIECES"
+    if [[ -n $eng ]]; then printf 'engine=%s\n' "$eng"; fi
+  } >"$tmp" && mv "$tmp" "$CONFIG_FILE" || die "Couldn't write $CONFIG_FILE"
+  chmod 600 "$CONFIG_FILE" 2>/dev/null
+}
+
+platform_label() { case $1 in chesscom) printf 'Chess.com';; lichess) printf 'Lichess';; pgn) printf 'PGN file';; *) printf '%s' "$1";; esac; }
+
+norm_platform() {
+  case ${1,,} in
+    chess.com|chesscom|cc|c|com) printf 'chesscom';;
+    lichess|lichess.org|li|l)    printf 'lichess';;
+    *) return 1;;
+  esac
+}
+
+# ─── http ───────────────────────────────────────────────────────────────────
+# http_get URL OUTFILE [ACCEPT] → prints HTTP status (000 on network failure)
+http_get() {
+  curl -sS -L --compressed --retry 2 --retry-delay 1 --connect-timeout 10 --max-time 60 \
+    -A "$UA" -H "Accept: ${3:-application/json}" -o "$2" -w '%{http_code}' "$1" 2>/dev/null || true
+}
+
+check_user_exists() { # platform user → 0 found, 1 not found, 2 network problem
+  local tmp code; tmp=$(mktemp)
+  case $1 in
+    chesscom) code=$(http_get "https://api.chess.com/pub/player/${2,,}" "$tmp") ;;
+    lichess)  code=$(http_get "https://lichess.org/api/user/$2" "$tmp") ;;
+  esac
+  local rc=2
+  case $code in
+    200) rc=0
+         [[ $1 == lichess ]] && jq -e '.disabled == true or .closed == true' "$tmp" >/dev/null 2>&1 && rc=1 ;;
+    404|410) rc=1 ;;
+  esac
+  rm -f "$tmp"; return $rc
+}
+
+# ─── setup (-u) ─────────────────────────────────────────────────────────────
+pick_platform() {
+  local cur=$1 choice
+  printf '\n  %sSelect platform%s\n\n' "$BOLD" "$R" >&2
+  printf '    %s1%s  Chess.com %s\n' "$GREEN" "$R" "$([[ $cur == chesscom ]] && printf '%s(current)%s' "$DIM" "$R")" >&2
+  printf '    %s2%s  Lichess   %s\n\n' "$GREEN" "$R" "$([[ $cur == lichess ]] && printf '%s(current)%s' "$DIM" "$R")" >&2
+  while true; do
+    read -rp "  Choice [1/2]${cur:+ (enter keeps current)}: " choice </dev/tty || return 1
+    case ${choice,,} in
+      1|c|chess.com|chesscom) printf 'chesscom'; return 0;;
+      2|l|lichess)            printf 'lichess'; return 0;;
+      '') [[ -n $cur ]] && { printf '%s' "$cur"; return 0; };;
+    esac
+    warn "Please type 1 or 2."
+  done
+}
+
+cmd_user() {
+  need curl jq
+  load_config
+  local platform="" user=""
+  case $# in
+    0) ;;
+    1) if [[ $1 == *:* ]]; then platform=$(norm_platform "${1%%:*}") || die "Unknown platform '${1%%:*}'"; user=${1#*:}
+       elif p=$(norm_platform "$1"); then platform=$p
+       else user=$1; platform=$PLATFORM; fi ;;
+    *) platform=$(norm_platform "$1") || die "Unknown platform '$1' (use chess.com or lichess)"; user=$2 ;;
+  esac
+
+  printf '\n  %s♞ chess%s %s· account setup%s\n' "$BOLD" "$R" "$DIM" "$R" >&2
+  [[ -n $USERNAME ]] && printf '  %scurrent: %s on %s%s\n' "$DIM" "$USERNAME" "$(platform_label "$PLATFORM")" "$R" >&2
+
+  if [[ -z $platform ]]; then platform=$(pick_platform "$PLATFORM") || exit 1; fi
+  if [[ -z $user ]]; then
+    local def=""; [[ $platform == "$PLATFORM" ]] && def=$USERNAME
+    printf '\n' >&2
+    while [[ -z $user ]]; do
+      read -rp "  $(platform_label "$platform") username${def:+ [$def]}: " user </dev/tty || exit 1
+      user=${user//[[:space:]]/}; [[ -z $user ]] && user=$def
+    done
+  fi
+  [[ $user =~ ^[A-Za-z0-9_-]{2,30}$ ]] || die "'$user' doesn't look like a valid username."
+
+  printf '\n' >&2; info "Checking $user on $(platform_label "$platform")…"
+  check_user_exists "$platform" "$user"
+  case $? in
+    0) ok "Found $BOLD$user$R" ;;
+    1) die "User '$user' not found on $(platform_label "$platform")." ;;
+    2) warn "Couldn't reach $(platform_label "$platform") to verify the account."
+       local yn; read -rp "  Save anyway? [y/N] " yn </dev/tty; [[ ${yn,,} == y* ]] || exit 1 ;;
+  esac
+  PLATFORM=$platform USERNAME=$user
+  save_config
+  ok "Saved to ${DIM}$CONFIG_FILE$R"
+  printf '\n  Run %schess -a%s to review your games.\n\n' "$BOLD" "$R" >&2
+}
+
+cmd_config() {
+  load_config
+  printf '\n  %s♞ chess %s%s\n\n' "$BOLD" "$VERSION" "$R"
+  printf '  %-10s %s\n' "platform" "${PLATFORM:+$(platform_label "$PLATFORM")}" "username" "${USERNAME:-${DIM}(not set — run chess -u)$R}" \
+    "games" "$NGAMES" "depth" "$DEPTH" "threads" "$THREADS" "pieces" "$PIECES" \
+    "engine" "${ENGINE:-${DIM}not found (install stockfish for full analysis)$R}" \
+    "config" "$CONFIG_FILE" "cache" "$CACHE_DIR"
+  printf '\n'
+}
+
+# ─── jq helpers ─────────────────────────────────────────────────────────────
+JQ_LIB='
+def pad($n): tostring | if length > $n then .[0:$n-1] + "…" elif length == $n then . else . + (" " * ($n - length)) end;
+def lpad($n): tostring | if length >= $n then . else (" " * ($n - length)) + . end;
+def pgn_moves:
+  split("\n") | map(select(test("^\\s*\\[") | not)) | join(" ")
+  | gsub("\\{[^}]*\\}"; " ")
+  | until(test("\\([^()]*\\)") | not; gsub("\\([^()]*\\)"; " "))
+  | gsub("\\$[0-9]+"; " ")
+  | gsub("(1-0|0-1|1/2-1/2|\\*)"; " ")
+  | gsub("[0-9]+\\.+"; " ")
+  | gsub("[!?]+"; "")
+  | [splits("\\s+")] | map(select(length > 0));
+def tag($k): ((capture("\\[" + $k + " \"(?<v>[^\"]*)\"\\]")) // {v: ""}).v;
+def mins($s): if $s == 15 then "¼" elif $s == 30 then "½" elif $s == 45 then "¾"
+              elif $s % 60 == 0 then ($s / 60 | floor | tostring) else ($s / 60 * 10 | floor / 10 | tostring) end;
+'
+
+JQ_LICHESS='
+select(((.variant // "standard") | IN("standard", "fromPosition"))
+       and ((.status // "") | IN("aborted", "noStart", "created", "started") | not))
+| def pname(p): (p.user.name // (if p.aiLevel then "Stockfish level \(p.aiLevel)" else "Anonymous" end));
+  .players.white as $w | .players.black as $b
+| (if (($w.user.id // "") == $me) then "white" else "black" end) as $col
+| {
+    platform: "lichess", id: .id,
+    url: ("https://lichess.org/" + .id + (if $col == "black" then "/black" else "" end)),
+    white: pname($w), black: pname($b),
+    white_elo: ($w.rating // null), black_elo: ($b.rating // null),
+    color: $col,
+    outcome: (if .winner == null then "draw" elif .winner == $col then "win" else "loss" end),
+    termination: .status, speed: .speed, rated: (.rated // false),
+    tc: (if .clock then "\(mins(.clock.initial))+\(.clock.increment)"
+         elif .daysPerTurn then "\(.daysPerTurn) day" else "∞" end),
+    date: ((.createdAt // 0) / 1000 | floor),
+    opening: (.opening.name // ""), eco: (.opening.eco // ""),
+    start_fen: (.initialFen // null),
+    moves: ((.moves // "") | split(" ") | map(select(length > 0))),
+    evals: (if (.analysis | type) == "array" then
+              [.analysis[] | {cp: (.eval // null), mate: (.mate // null), best: (.best // null), judgment: (.judgment.name // null)}]
+            else null end),
+    summary: (if $w.analysis then {white: $w.analysis, black: $b.analysis} else null end),
+    accuracy: (if $w.analysis.accuracy then {white: $w.analysis.accuracy, black: $b.analysis.accuracy} else null end)
+  }'
+
+JQ_CHESSCOM='
+.games // [] | reverse | .[]
+| select((.rules // "chess") == "chess" and (.pgn // "") != "")
+| ((.white.username | ascii_downcase) == $me) as $iw
+| (if $iw then "white" else "black" end) as $col
+| (if $iw then .white else .black end) as $mine
+| (if $iw then .black else .white end) as $opp
+| (if $mine.result == "win" then "win"
+   elif ($mine.result | IN("agreed","repetition","stalemate","insufficient","50move","timevsinsufficient")) then "draw"
+   else "loss" end) as $out
+| (.pgn | tag("FEN")) as $fen
+| {
+    platform: "chesscom", id: (.url | split("/") | last), url: .url,
+    white: .white.username, black: .black.username,
+    white_elo: .white.rating, black_elo: .black.rating,
+    color: $col, outcome: $out,
+    termination: (if $out == "win" then $opp.result else $mine.result end),
+    speed: .time_class, rated: (.rated // false),
+    tc: ((.time_control // "") | if contains("/") then ((split("/")[1] | tonumber / 86400 | floor | tostring) + " day")
+          elif . == "" then "?" else (split("+")) as $p | "\(mins($p[0] | tonumber))+\($p[1] // "0")" end),
+    date: .end_time,
+    opening: ((.eco // (.pgn | tag("ECOUrl"))) | split("/") | last | gsub("-"; " ") | gsub(" [0-9]+\\..*$"; "")),
+    eco: (.pgn | tag("ECO")),
+    start_fen: (if $fen == "" then null else $fen end),
+    moves: (.pgn | pgn_moves),
+    evals: null, summary: null,
+    accuracy: (.accuracies // null)
+  }'
+
+JQ_PGNFILE='
+split("\n[Event ")[0] as $p
+| ($p | tag("Result")) as $res
+| ($p | tag("FEN")) as $fen
+| {
+    platform: "pgn", id: ("pgn-" + ($p | length | tostring)), url: "",
+    white: ($p | tag("White")), black: ($p | tag("Black")),
+    white_elo: (($p | tag("WhiteElo")) | tonumber? // null), black_elo: (($p | tag("BlackElo")) | tonumber? // null),
+    color: "white",
+    outcome: (if $res == "1-0" then "win" elif $res == "0-1" then "loss" elif $res == "1/2-1/2" then "draw" else "unknown" end),
+    termination: ($p | tag("Termination")), speed: ($p | tag("Event")), rated: false,
+    tc: ($p | tag("TimeControl")), date: null, date_str: ($p | tag("Date")),
+    opening: ((($p | tag("Opening")) as $o | if $o != "" then $o else (($p | tag("ECOUrl")) | split("/") | last | gsub("-"; " ")) end)),
+    eco: ($p | tag("ECO")),
+    start_fen: (if $fen == "" then null else $fen end),
+    moves: ($p | pgn_moves), evals: null, summary: null, accuracy: null
+  }'
+
+# ─── fetching ───────────────────────────────────────────────────────────────
+fetch_lichess() { # user n out
+  local tmp code; tmp=$(mktemp)
+  code=$(http_get "https://lichess.org/api/games/user/$1?max=$2&moves=true&evals=true&accuracy=true&opening=true&clocks=false&finished=true" \
+         "$tmp" "application/x-ndjson")
+  case $code in
+    200) ;;
+    404) rm -f "$tmp"; die "Lichess user '$1' not found." ;;
+    429) rm -f "$tmp"; die "Lichess rate limit hit — wait a minute and try again." ;;
+    000) rm -f "$tmp"; die "Network error — couldn't reach lichess.org." ;;
+    *)   rm -f "$tmp"; die "Lichess API returned HTTP $code." ;;
+  esac
+  jq -c --arg me "${1,,}" "$JQ_LIB $JQ_LICHESS" "$tmp" >"$3" || { rm -f "$tmp"; die "Couldn't parse Lichess response."; }
+  rm -f "$tmp"
+}
+
+fetch_chesscom() { # user n out
+  local u=${1,,} n=$2 out=$3 tmp code archives url got=0 month=0
+  tmp=$(mktemp)
+  code=$(http_get "https://api.chess.com/pub/player/$u/games/archives" "$tmp")
+  case $code in
+    200) ;;
+    404|410) rm -f "$tmp"; die "Chess.com user '$1' not found." ;;
+    000) rm -f "$tmp"; die "Network error — couldn't reach api.chess.com." ;;
+    *)   rm -f "$tmp"; die "Chess.com API returned HTTP $code." ;;
+  esac
+  mapfile -t archives < <(jq -r '.archives[]?' "$tmp" | tac)
+  : >"$out"
+  for url in "${archives[@]}"; do
+    ((month++ >= 24)) && break
+    code=$(http_get "$url" "$tmp")
+    [[ $code == 200 ]] || { warn "Skipping ${url##*/games/} (HTTP $code)"; continue; }
+    jq -c --arg me "$u" "$JQ_LIB $JQ_CHESSCOM" "$tmp" >>"$out" || true
+    got=$(wc -l <"$out")
+    ((got >= n)) && break
+  done
+  rm -f "$tmp"
+  local t="$out.tmp"; head -n "$n" "$out" >"$t" && mv "$t" "$out"
+}
+
+# ─── game list (fzf) ────────────────────────────────────────────────────────
+list_lines() { # file cols → "idx<TAB>display"
+  local ow=$(( $2 - 82 )); ((ow < 12)) && ow=12
+  jq -rs --argjson ow "$ow" "$JQ_LIB"'
+    def c($code): "\u001b[" + $code + "m";
+    to_entries[] | .key as $k | .value as $g
+    | ($g.color == "white") as $iw
+    | (if $iw then $g.black else $g.white end) as $opp
+    | (if $iw then $g.black_elo else $g.white_elo end) as $oelo
+    | ((if $g.outcome == "win" then c("1;38;5;114") + "WIN " elif $g.outcome == "loss" then c("1;38;5;203") + "LOSS"
+        else c("38;5;250") + "DRAW" end) + c("0")) as $res
+    | (if $iw then "○" else "●" end) as $dot
+    | (if $g.accuracy and $g.accuracy[$g.color] then ($g.accuracy[$g.color] * 10 | round / 10 | tostring) else "–" end) as $acc
+    | (($g.speed // "") | if . == "correspondence" then "daily" else . end) as $speed
+    | "\($k + 1)\t "
+      + c("38;5;245") + (if $g.date then ($g.date | strflocaltime("%b %d %H:%M")) else "            " end) + c("0") + "  "
+      + $res + "  " + $dot + " "
+      + c("1") + ($opp | pad(18)) + c("0") + " "
+      + c("38;5;245") + (($oelo // "") | lpad(4)) + c("0") + "  "
+      + c("38;5;117") + ($g.tc | pad(7)) + c("0")
+      + ($speed | pad(9))
+      + c("38;5;221") + ($acc | lpad(5)) + c("0") + " "
+      + (if $g.evals then c("38;5;176") + "◆" + c("0") else " " end) + "  "
+      + c("38;5;250") + ($g.opening | pad($ow)) + c("0")
+  ' "$1"
+}
+
+list_header() {
+  printf '%s %-12s  %-4s  %-20s %4s  %-7s%-9s%5s    %s%s' "$DIM" "DATE" "RES" "OPPONENT" "ELO" "TIME" "SPEED" "ACC" "OPENING" "$R"
+}
+
+cmd_preview() { # idx file  (used by fzf preview)
+  local idx=$1 file=$2
+  [[ $idx =~ ^[0-9]+$ && -f $file ]] || return 0
+  sed -n "${idx}p" "$file" | jq -r "$JQ_LIB"'
+    def c($code): "\u001b[" + $code + "m";
+    . as $g
+    | (if .outcome == "draw" then "½-½" elif (.outcome == "win") == (.color == "white") then "1-0" else "0-1" end) as $score
+    | c("1") + "○ " + .white + c("0") + c("38;5;245") + " (" + ((.white_elo // "?") | tostring) + ")" + c("0") + "\n"
+    + c("1") + "● " + .black + c("0") + c("38;5;245") + " (" + ((.black_elo // "?") | tostring) + ")" + c("0") + "\n\n"
+    + c("1;38;5;221") + $score + c("0") + "  " + c("38;5;245") + (.termination // "") + c("0") + "\n"
+    + c("38;5;117") + .tc + c("0") + " " + (.speed // "") + (if .rated then " · rated" else " · casual" end) + "\n"
+    + (if .date then (.date | strflocaltime("%a %d %b %Y, %H:%M")) + "\n" else "" end)
+    + (if .opening != "" then c("3;38;5;250") + (if .eco != "" then .eco + " " else "" end) + .opening + c("0") + "\n" else "" end)
+    + (if .summary then "\n" + c("38;5;176") + "◆ Lichess analysis" + c("0") + "\n"
+         + ([("white", "black") as $s | .summary[$s] |
+              "  \(if $s == "white" then "○" else "●" end) " + c("38;5;221") + "\(.inaccuracy // 0)?!" + c("0") + "  "
+              + c("38;5;209") + "\(.mistake // 0)?" + c("0") + "  " + c("38;5;203") + "\(.blunder // 0)??" + c("0")
+              + c("38;5;245") + "  acpl \(.acpl // "-")" + (if .accuracy then "  acc \(.accuracy)%" else "" end) + c("0")] | join("\n")) + "\n"
+       elif .accuracy then "\n" + c("38;5;245") + "Accuracy  ○ \(.accuracy.white // "-")   ● \(.accuracy.black // "-")" + c("0") + "\n"
+       else "" end)
+    + "\n" + c("38;5;245") + "\(.moves | length) plies" + c("0") + "\n"
+    + ([.moves | to_entries[] | if .key % 2 == 0 then c("38;5;245") + "\(.key / 2 + 1 | floor)." + c("0") + .value else .value end] | join(" "))
+  ' 2>/dev/null
+}
+
+# ─── board core (0x88) ──────────────────────────────────────────────────────
+FILES=abcdefgh
+declare -a B MOVES
+SIDE=w CASTLE=KQkq EP=-1 HALF=0 FULL=1
+N_OFF=(33 31 18 14 -33 -31 -18 -14)
+K_OFF=(1 -1 16 -16 15 -15 17 -17)
+DIAG=(15 -15 17 -17)
+ORTH=(1 -1 16 -16)
+
+sqn() { SQN="${FILES:$(($1 & 7)):1}$((($1 >> 4) + 1))"; }
+sqi() { local f=${1:0:1} r=${1:1:1} t; t=${FILES%%"$f"*}; SQI=$(( (r - 1) * 16 + ${#t} )); }
+
+load_fen() {
+  local place ep c i r=7 f=0
+  read -r place SIDE CASTLE ep HALF FULL <<<"$1"
+  for ((i = 0; i < 128; i++)); do B[i]=.; done
+  for ((i = 0; i < ${#place}; i++)); do
+    c=${place:i:1}
+    case $c in
+      /) ((r--)); f=0 ;;
+      [1-8]) ((f += c)) ;;
+      *) B[r * 16 + f]=$c; ((f++)) ;;
+    esac
+  done
+  [[ $CASTLE == - ]] && CASTLE=""
+  if [[ -z $ep || $ep == - ]]; then EP=-1; else sqi "$ep"; EP=$SQI; fi
+  [[ $HALF =~ ^[0-9]+$ ]] || HALF=0
+  [[ $FULL =~ ^[0-9]+$ ]] || FULL=1
+}
+
+to_fen() {
+  local r f e out="" p
+  for ((r = 7; r >= 0; r--)); do
+    e=0
+    for ((f = 0; f < 8; f++)); do
+      p=${B[r * 16 + f]}
+      if [[ $p == . ]]; then ((e++)); else ((e)) && out+=$e; e=0; out+=$p; fi
+    done
+    ((e)) && out+=$e
+    ((r)) && out+=/
+  done
+  local ep=-; ((EP >= 0)) && { sqn "$EP"; ep=$SQN; }
+  FEN="$out $SIDE ${CASTLE:--} $ep $HALF $FULL"
+}
+
+pos_string() { local r f; PS=""; for ((r = 7; r >= 0; r--)); do for ((f = 0; f < 8; f++)); do PS+=${B[r * 16 + f]}; done; done; }
+
+is_attacked() { # sq byColor
+  local sq=$1 t d p n b r q k
+  if [[ $2 == w ]]; then
+    n=N b=B r=R q=Q k=K
+    t=$((sq - 15)); ((!(t & 0x88))) && [[ ${B[t]} == P ]] && return 0
+    t=$((sq - 17)); ((!(t & 0x88))) && [[ ${B[t]} == P ]] && return 0
+  else
+    n=n b=b r=r q=q k=k
+    t=$((sq + 15)); ((!(t & 0x88))) && [[ ${B[t]} == p ]] && return 0
+    t=$((sq + 17)); ((!(t & 0x88))) && [[ ${B[t]} == p ]] && return 0
+  fi
+  for d in "${N_OFF[@]}"; do t=$((sq + d)); ((t & 0x88)) && continue; [[ ${B[t]} == "$n" ]] && return 0; done
+  for d in "${K_OFF[@]}"; do t=$((sq + d)); ((t & 0x88)) && continue; [[ ${B[t]} == "$k" ]] && return 0; done
+  for d in "${DIAG[@]}"; do
+    t=$((sq + d))
+    while ((!(t & 0x88))); do
+      p=${B[t]}
+      if [[ $p != . ]]; then [[ $p == "$b" || $p == "$q" ]] && return 0; break; fi
+      ((t += d))
+    done
+  done
+  for d in "${ORTH[@]}"; do
+    t=$((sq + d))
+    while ((!(t & 0x88))); do
+      p=${B[t]}
+      if [[ $p != . ]]; then [[ $p == "$r" || $p == "$q" ]] && return 0; break; fi
+      ((t += d))
+    done
+  done
+  return 1
+}
+
+find_king() { local s; for ((s = 0; s < 120; s++)); do ((s & 0x88)) && continue; [[ ${B[s]} == "$1" ]] && { KSQ=$s; return 0; }; done; KSQ=-1; return 1; }
+
+# gen_from SQ → appends pseudo-legal moves "from:to:promo" to MOVES
+gen_from() {
+  local from=$1 p=${B[$1]} t d en opp dirs
+  if [[ $p == [A-Z] ]]; then en='[a-z]' opp=b; else en='[A-Z]' opp=w; fi
+  case $p in
+    P|p)
+      local dir=16 start=1 last=7 t2 pr
+      [[ $p == p ]] && dir=-16 start=6 last=0
+      t=$((from + dir))
+      if ((!(t & 0x88))) && [[ ${B[t]} == . ]]; then
+        if (((t >> 4) == last)); then for pr in q r b n; do MOVES+=("$from:$t:$pr"); done
+        else
+          MOVES+=("$from:$t:-")
+          t2=$((t + dir))
+          (((from >> 4) == start)) && [[ ${B[t2]} == . ]] && MOVES+=("$from:$t2:-")
+        fi
+      fi
+      for d in $((dir - 1)) $((dir + 1)); do
+        t=$((from + d)); ((t & 0x88)) && continue
+        if [[ ${B[t]} == $en ]] || ((t == EP)); then
+          if (((t >> 4) == last)); then for pr in q r b n; do MOVES+=("$from:$t:$pr"); done
+          else MOVES+=("$from:$t:-"); fi
+        fi
+      done ;;
+    N|n|K|k)
+      if [[ $p == [Nn] ]]; then dirs=("${N_OFF[@]}"); else dirs=("${K_OFF[@]}"); fi
+      for d in "${dirs[@]}"; do
+        t=$((from + d)); ((t & 0x88)) && continue
+        [[ ${B[t]} == . || ${B[t]} == $en ]] && MOVES+=("$from:$t:-")
+      done
+      if [[ $p == K && $from == 4 ]]; then
+        [[ $CASTLE == *K* && ${B[5]}${B[6]} == .. && ${B[7]} == R ]] &&
+          ! is_attacked 4 b && ! is_attacked 5 b && ! is_attacked 6 b && MOVES+=("4:6:-")
+        [[ $CASTLE == *Q* && ${B[1]}${B[2]}${B[3]} == ... && ${B[0]} == R ]] &&
+          ! is_attacked 4 b && ! is_attacked 3 b && ! is_attacked 2 b && MOVES+=("4:2:-")
+      elif [[ $p == k && $from == 116 ]]; then
+        [[ $CASTLE == *k* && ${B[117]}${B[118]} == .. && ${B[119]} == r ]] &&
+          ! is_attacked 116 w && ! is_attacked 117 w && ! is_attacked 118 w && MOVES+=("116:118:-")
+        [[ $CASTLE == *q* && ${B[113]}${B[114]}${B[115]} == ... && ${B[112]} == r ]] &&
+          ! is_attacked 116 w && ! is_attacked 115 w && ! is_attacked 114 w && MOVES+=("116:114:-")
+      fi ;;
+    B|b|R|r|Q|q)
+      case $p in [Bb]) dirs=("${DIAG[@]}");; [Rr]) dirs=("${ORTH[@]}");; *) dirs=("${DIAG[@]}" "${ORTH[@]}");; esac
+      for d in "${dirs[@]}"; do
+        t=$((from + d))
+        while ((!(t & 0x88))); do
+          if [[ ${B[t]} == . ]]; then MOVES+=("$from:$t:-")
+          else [[ ${B[t]} == $en ]] && MOVES+=("$from:$t:-"); break; fi
+          ((t += d))
+        done
+      done ;;
+  esac
+}
+
+make_move() { # from to promo
+  local from=$1 to=$2 pr=${3:--} p=${B[$1]} cap=${B[$2]} s
+  local up=${p^^}
+  if [[ $up == P ]] && ((to == EP)) && [[ $cap == . ]]; then
+    if [[ $p == P ]]; then B[to - 16]=.; else B[to + 16]=.; fi
+    cap=x
+  fi
+  B[to]=$p; B[from]=.
+  if [[ $up == P && $pr != - ]]; then
+    if [[ $p == P ]]; then B[to]=${pr^^}; else B[to]=${pr,,}; fi
+  fi
+  if [[ $up == K ]] && ((to - from == 2 || from - to == 2)); then
+    case $to in
+      6)   B[5]=${B[7]};     B[7]=. ;;
+      2)   B[3]=${B[0]};     B[0]=. ;;
+      118) B[117]=${B[119]}; B[119]=. ;;
+      114) B[115]=${B[112]}; B[112]=. ;;
+    esac
+  fi
+  [[ $p == K ]] && CASTLE=${CASTLE//[KQ]/}
+  [[ $p == k ]] && CASTLE=${CASTLE//[kq]/}
+  for s in "$from" "$to"; do
+    case $s in 0) CASTLE=${CASTLE//Q/};; 7) CASTLE=${CASTLE//K/};; 112) CASTLE=${CASTLE//q/};; 119) CASTLE=${CASTLE//k/};; esac
+  done
+  if [[ $up == P ]] && ((to - from == 32 || from - to == 32)); then EP=$(((from + to) / 2)); else EP=-1; fi
+  if [[ $up == P || $cap != . ]]; then HALF=0; else ((HALF++)); fi
+  if [[ $SIDE == b ]]; then ((FULL++)); SIDE=w; else SIDE=b; fi
+}
+
+is_legal() { # from to promo — would the mover's king be safe?
+  local -a sb=("${B[@]}")
+  local s_side=$SIDE s_c=$CASTLE s_ep=$EP s_h=$HALF s_f=$FULL k=K opp=b rc=1
+  [[ $SIDE == b ]] && k=k opp=w
+  make_move "$1" "$2" "$3"
+  find_king "$k" && ! is_attacked "$KSQ" "$opp" && rc=0
+  B=("${sb[@]}"); SIDE=$s_side CASTLE=$s_c EP=$s_ep HALF=$s_h FULL=$s_f
+  return $rc
+}
+
+has_legal_move() {
+  local s m own='[A-Z]' rest; [[ $SIDE == b ]] && own='[a-z]'
+  local -a ms
+  for ((s = 0; s < 120; s++)); do
+    ((s & 0x88)) && continue
+    [[ ${B[s]} == $own ]] || continue
+    MOVES=(); gen_from "$s"; ms=("${MOVES[@]}")
+    for m in "${ms[@]}"; do rest=${m#*:}; is_legal "$s" "${rest%%:*}" "${rest#*:}" && return 0; done
+  done
+  return 1
+}
+
+# san_to_move SAN → MV_FROM MV_TO MV_PR
+san_to_move() {
+  local san=$1 piece ff fr tgt pr pc s m found=0 t
+  san=${san%%[+#!?]*}; san=${san//0/O}
+  if [[ $san == O-O || $san == O-O-O ]]; then
+    local k=K; [[ $SIDE == b ]] && k=k
+    find_king "$k" || return 1
+    local kf=$KSQ
+    if [[ $san == O-O-O ]]; then t=$((kf - 2)); else t=$((kf + 2)); fi
+    MOVES=(); gen_from "$kf"
+    for m in "${MOVES[@]}"; do
+      [[ $m == "$kf:$t:-" ]] && is_legal "$kf" "$t" - && { MV_FROM=$kf MV_TO=$t MV_PR=-; return 0; }
+    done
+    return 1
+  fi
+  [[ $san =~ ^([NBRQK])?([a-h])?([1-8])?x?([a-h][1-8])=?([NBRQnbrq])?$ ]] || return 1
+  piece=${BASH_REMATCH[1]:-P} ff=${BASH_REMATCH[2]} fr=${BASH_REMATCH[3]} pr=${BASH_REMATCH[5],,}
+  [[ -z $pr ]] && pr=-
+  sqi "${BASH_REMATCH[4]}"; tgt=$SQI
+  pc=$piece; [[ $SIDE == b ]] && pc=${piece,,}
+  local ffi=-1; if [[ -n $ff ]]; then t=${FILES%%"$ff"*}; ffi=${#t}; fi
+  for ((s = 0; s < 120; s++)); do
+    ((s & 0x88)) && continue
+    [[ ${B[s]} == "$pc" ]] || continue
+    ((ffi >= 0 && (s & 7) != ffi)) && continue
+    [[ -n $fr ]] && (((s >> 4) != fr - 1)) && continue
+    MOVES=(); gen_from "$s"
+    for m in "${MOVES[@]}"; do
+      [[ $m == "$s:$tgt:$pr" ]] || continue
+      is_legal "$s" "$tgt" "$pr" || continue
+      MV_FROM=$s MV_TO=$tgt MV_PR=$pr; ((found++))
+    done
+  done
+  ((found == 1))
+}
+
+# uci_to_san FROM TO PROMO → SANOUT (with +/#), position unchanged
+uci_to_san() {
+  local from=$1 to=$2 pr=${3:--} p=${B[$1]} up s m cap=0 dis="" sf=0 sr=0 others=0
+  [[ $p == . || -z $p ]] && return 1
+  up=${p^^}
+  if [[ $up == K ]] && ((to - from == 2)); then SANOUT=O-O
+  elif [[ $up == K ]] && ((from - to == 2)); then SANOUT=O-O-O
+  else
+    [[ ${B[to]} != . ]] && cap=1
+    [[ $up == P ]] && ((to == EP)) && cap=1
+    sqn "$to"; local tsq=$SQN
+    if [[ $up == P ]]; then
+      SANOUT=""; ((cap)) && SANOUT="${FILES:$((from & 7)):1}x"
+      SANOUT+=$tsq; [[ $pr != - ]] && SANOUT+="=${pr^^}"
+    else
+      for ((s = 0; s < 120; s++)); do
+        ((s & 0x88 || s == from)) && continue
+        [[ ${B[s]} == "$p" ]] || continue
+        MOVES=(); gen_from "$s"
+        for m in "${MOVES[@]}"; do
+          [[ $m == "$s:$to:-" ]] && is_legal "$s" "$to" - && {
+            others=1; (((s & 7) == (from & 7))) && sf=1; (((s >> 4) == (from >> 4))) && sr=1; }
+        done
+      done
+      if ((others)); then
+        if ((!sf)); then dis=${FILES:$((from & 7)):1}
+        elif ((!sr)); then dis=$(((from >> 4) + 1))
+        else sqn "$from"; dis=$SQN; fi
+      fi
+      SANOUT="$up$dis"; ((cap)) && SANOUT+=x; SANOUT+=$tsq
+    fi
+  fi
+  local -a sb=("${B[@]}")
+  local s_side=$SIDE s_c=$CASTLE s_ep=$EP s_h=$HALF s_f=$FULL mover=$SIDE k=k
+  [[ $mover == b ]] && k=K
+  make_move "$from" "$to" "$pr"
+  if find_king "$k" && is_attacked "$KSQ" "$mover"; then
+    if has_legal_move; then SANOUT+=+; else SANOUT+='#'; fi
+  fi
+  B=("${sb[@]}"); SIDE=$s_side CASTLE=$s_c EP=$s_ep HALF=$s_h FULL=$s_f
+  return 0
+}
+
+uci_parse() { sqi "${1:0:2}"; UF=$SQI; sqi "${1:2:2}"; UT=$SQI; UP=${1:4:1}; UP=${UP:--}; }
+
+# replay SAN[] from START_FEN → POS[] FENS[] LASTMV[] UCI[] MOVER[] MOVENO[]
+replay() {
+  local i n=${#SAN[@]}
+  load_fen "${START_FEN:-$STARTFEN}"
+  POS=() FENS=() LASTMV=() UCI=() MOVER=() MOVENO=()
+  pos_string; POS[0]=$PS; to_fen; FENS[0]=$FEN; LASTMV[0]=""
+  REPLAY_ERR=""
+  for ((i = 0; i < n; i++)); do
+    if ! san_to_move "${SAN[i]}"; then
+      REPLAY_ERR="Couldn't read move $((i + 1)) ('${SAN[i]}') — showing the game up to there."
+      SAN=("${SAN[@]:0:i}"); break
+    fi
+    MOVER[i + 1]=$SIDE; MOVENO[i + 1]=$FULL
+    sqn "$MV_FROM"; local u=$SQN; sqn "$MV_TO"; u+=$SQN; [[ $MV_PR != - ]] && u+=$MV_PR
+    UCI[i + 1]=$u
+    make_move "$MV_FROM" "$MV_TO" "$MV_PR"
+    pos_string; POS[i + 1]=$PS; to_fen; FENS[i + 1]=$FEN; LASTMV[i + 1]="$MV_FROM $MV_TO"
+  done
+  NPLY=${#SAN[@]}
+}
+
+# ─── evaluation ─────────────────────────────────────────────────────────────
+progress() { # cur total label
+  local w=28 f=$(($1 * 28 / ($2 > 0 ? $2 : 1))) bar
+  printf -v bar '%*s' "$f" ''; bar=${bar// /█}
+  local rest; printf -v rest '%*s' $((w - f)) ''; rest=${rest// /░}
+  printf '\r  %s%s%s %s%s%s%s %d/%d ' "$CYAN" "$3" "$R" "$GREEN" "$bar" "$GREY$rest" "$R" "$1" "$2" >&2
+}
+
+engine_analyze() { # → EVCP[] EVMATE[] BESTUCI[] for positions 0..NPLY
+  local n=$((NPLY + 1)) i line st sv best stm sign cache
+  mkdir -p "$CACHE_DIR/eval"
+  cache="$CACHE_DIR/eval/${G_PLATFORM}-${G_ID//[^A-Za-z0-9_-]/_}-d$DEPTH-$NPLY.tsv"
+  if [[ -s $cache ]] && (($(wc -l <"$cache") == n)); then
+    i=0
+    while IFS='|' read -r st sv best; do EVCP[i]=$st EVMATE[i]=$sv BESTUCI[i]=$best; ((i++)); done <"$cache"
+    return 0
+  fi
+  coproc SF { exec "$ENGINE" 2>/dev/null; }
+  local in=${SF[1]} out=${SF[0]}
+  [[ -n $in && -n $out ]] || { warn "Couldn't start engine: $ENGINE"; return 1; }
+  printf 'uci\n' >&"$in"
+  while read -r -t 15 -u "$out" line; do [[ $line == uciok* ]] && break; done
+  printf 'setoption name Threads value %s\nsetoption name Hash value 64\nucinewgame\nisready\n' "$THREADS" >&"$in"
+  while read -r -t 15 -u "$out" line; do [[ $line == readyok* ]] && break; done
+  : >"$cache.tmp"
+  for ((i = 0; i < n; i++)); do
+    progress "$i" "$n" "Stockfish d$DEPTH "
+    printf 'position fen %s\ngo depth %s\n' "${FENS[i]}" "$DEPTH" >&"$in"
+    st="" sv="" best=""
+    while read -r -t 120 -u "$out" line; do
+      case $line in
+        info*score*)
+          [[ $line == *bound* ]] && continue
+          [[ $line =~ score\ (cp|mate)\ (-?[0-9]+) ]] && st=${BASH_REMATCH[1]} sv=${BASH_REMATCH[2]} ;;
+        bestmove*) best=${line#bestmove }; best=${best%% *}; break ;;
+      esac
+    done
+    [[ $best == "(none)" ]] && best=""
+    stm=${FENS[i]#* }; stm=${stm%% *}; sign=1; [[ $stm == b ]] && sign=-1
+    if [[ $st == mate ]]; then
+      if ((sv == 0)); then EVCP[i]=$((-10000 * sign)); EVMATE[i]=0
+      else EVMATE[i]=$((sv * sign)); EVCP[i]=$(((sv > 0 ? 10000 : -10000) * sign)); fi
+    elif [[ $st == cp ]]; then EVCP[i]=$((sv * sign)); EVMATE[i]=""
+    else EVCP[i]="" EVMATE[i]=""; fi
+    BESTUCI[i]=$best
+    printf '%s|%s|%s\n' "${EVCP[i]}" "${EVMATE[i]}" "$best" >>"$cache.tmp"
+  done
+  progress "$n" "$n" "Stockfish d$DEPTH "; printf '\n' >&2
+  printf 'quit\n' >&"$in" 2>/dev/null
+  wait "$SF_PID" 2>/dev/null
+  mv "$cache.tmp" "$cache"
+}
+
+# classify → JUDG[] LOSS[] ; S_W_* / S_B_* ; GRAPH
+classify() {
+  local given=$1 i line kind a b c d e f g
+  JUDG=() LOSS=()
+  local w=$(( $(term_cols) - 14 )); ((w > 100)) && w=100
+  while IFS='|' read -r kind a b c d e f g; do
+    case $kind in
+      P) JUDG[a]=$b LOSS[a]=$c ;;
+      S) if [[ $a == w ]]; then S_W_ACC=$b S_W_ACPL=$c S_W_INA=$d S_W_MIS=$e S_W_BLU=$f
+         else S_B_ACC=$b S_B_ACPL=$c S_B_INA=$d S_B_MIS=$e S_B_BLU=$f; fi ;;
+      G) GRAPH=$a ;;
+    esac
+  done < <(
+    for ((i = 0; i <= NPLY; i++)); do printf '%s|%s|%s\n' "${EVCP[i]}" "${GIVEN[i]}" "${MOVER[i]}"; done |
+    awk -F'|' -v given="$given" -v width="$w" '
+      function clampc(c) { return c > 1000 ? 1000 : (c < -1000 ? -1000 : c) }
+      function wp(c) { c = clampc(c); return 50 + 50 * (2 / (1 + exp(-0.00368208 * c)) - 1) }
+      function sd(s, k,   j, m, v) { m = 0; for (j = s; j < s + k; j++) m += W[j]; m /= k
+                                     v = 0; for (j = s; j < s + k; j++) v += (W[j] - m) ^ 2; return sqrt(v / k) }
+      { cp[NR - 1] = $1; gj[NR - 1] = $2; mv[NR - 1] = $3; n = NR - 1 }
+      END {
+        last = 15
+        for (i = 0; i <= n; i++) { if (cp[i] == "") cp[i] = last; else cp[i] += 0; last = cp[i]; W[i] = wp(cp[i]) }
+        ws = int(n / 10); if (ws < 2) ws = 2; if (ws > 8) ws = 8; if (ws > n + 1) ws = n + 1
+        k = 0
+        for (j = 0; j < ws - 2; j++) wt[++k] = sd(0, ws)
+        for (s = 0; s + ws <= n + 1; s++) wt[++k] = sd(s, ws)
+        for (i = 1; i <= n; i++) {
+          white = (mv[i] == "w")
+          b = white ? W[i-1] : 100 - W[i-1]; a = white ? W[i] : 100 - W[i]
+          loss = b - a; if (loss < 0) loss = 0
+          c0 = clampc(cp[i-1]); c1 = clampc(cp[i])
+          cpl = white ? c0 - c1 : c1 - c0; if (cpl < 0) cpl = 0
+          if (given) j = gj[i]
+          else j = loss >= 15 ? "Blunder" : (loss >= 10 ? "Mistake" : (loss >= 5 ? "Inaccuracy" : ""))
+          acc = (a >= b) ? 100 : 103.1668100711649 * exp(-0.04354415386753951 * (b - a)) - 3.166924740191411 + 1
+          if (acc > 100) acc = 100; if (acc < 0) acc = 0
+          q = white ? "w" : "b"
+          weight = wt[i] < 0.5 ? 0.5 : (wt[i] > 12 ? 12 : wt[i])
+          cnt[q]++; sumcpl[q] += cpl; sw[q] += weight; swa[q] += acc * weight; hm[q] += 1 / (acc < 1 ? 1 : acc)
+          if (j == "Inaccuracy") ina[q]++; else if (j == "Mistake") mis[q]++; else if (j == "Blunder") blu[q]++
+          printf "P|%d|%s|%.1f\n", i, j, loss
+        }
+        split("w b", sides, " ")
+        for (t = 1; t <= 2; t++) { q = sides[t]
+          if (cnt[q]) printf "S|%s|%.1f|%d|%d|%d|%d\n", q, (swa[q] / sw[q] + cnt[q] / hm[q]) / 2, sumcpl[q] / cnt[q] + 0.5, ina[q], mis[q], blu[q]
+          else printf "S|%s|-|-|0|0|0\n", q }
+        split("▁ ▂ ▃ ▄ ▅ ▆ ▇ █", bars, " ")
+        m = n + 1; cols = m < width ? m : width; g = ""
+        for (x = 0; x < cols; x++) { i = int(x * m / cols); h = int(W[i] / 100 * 8) + 1; if (h > 8) h = 8; g = g bars[h] }
+        printf "G|%s\n", g
+      }')
+}
+
+fmt_eval() { # cp mate → EVS
+  local cp=$1 m=$2
+  if [[ -n $m ]]; then
+    if [[ $m == 0 ]]; then EVS="#"; elif ((m > 0)); then EVS="#$m"; else EVS="#-${m#-}"; fi
+  elif [[ -z $cp ]]; then EVS="?"
+  else
+    local s=+ a=${cp#-}; ((cp < 0)) && s=-; local r=$(((a + 5) / 10))
+    EVS="$s$((r / 10)).$((r % 10))"; [[ $EVS == -0.0 ]] && EVS=0.0; [[ $EVS == +0.0 ]] && EVS=0.0
+  fi
+}
+
+padc() { # str width → PADOUT (pads by characters, not bytes)
+  local n=$(($2 - ${#1})); ((n < 0)) && n=0; printf -v PADOUT '%s%*s' "$1" "$n" ''
+}
+
+judg_glyph() { # judgment → JG JC
+  case $1 in
+    Blunder)    JG='??' JC=$RED ;;
+    Mistake)    JG='?'  JC=$ORANGE ;;
+    Inaccuracy) JG='?!' JC=$YELLOW ;;
+    *)          JG=''   JC='' ;;
+  esac
+}
+
+move_label() { # ply → ML ("14." or "14…")
+  if [[ ${MOVER[$1]} == w ]]; then ML="${MOVENO[$1]}."; else ML="${MOVENO[$1]}…"; fi
+}
+
+best_san() { # ply → BS (SAN of engine best move instead of ply)
+  BS=""; local u=${BESTUCI[$(($1 - 1))]}
+  [[ -z $u || $u == "${UCI[$1]}" ]] && return 1
+  load_fen "${FENS[$(($1 - 1))]}"; uci_parse "$u"
+  uci_to_san "$UF" "$UT" "$UP" && BS=$SANOUT
+}
+
+# ─── review screen ──────────────────────────────────────────────────────────
+term_word() {
+  case $1 in
+    mate|checkmated) printf 'checkmate';; resign|resigned) printf 'resignation';;
+    outoftime|timeout) printf 'time';; abandoned) printf 'abandonment';;
+    draw|agreed) printf 'agreement';; repetition) printf 'repetition';; stalemate) printf 'stalemate';;
+    insufficient) printf 'insufficient material';; 50move) printf '50-move rule';;
+    timevsinsufficient) printf 'timeout vs insufficient material';; cheat) printf 'cheat detection';;
+    *) printf '%s' "$1";;
+  esac
+}
+
+load_game() { # file idx
+  local json; json=$(sed -n "$2p" "$1")
+  [[ -n $json ]] || die "Game not found."
+  eval "$(jq -r '@sh "G_PLATFORM=\(.platform) G_ID=\(.id) G_URL=\(.url // "") G_WHITE=\(.white // "?") G_BLACK=\(.black // "?") G_WELO=\(.white_elo // "") G_BELO=\(.black_elo // "") G_COLOR=\(.color) G_OUTCOME=\(.outcome) G_TERM=\(.termination // "") G_SPEED=\(.speed // "") G_RATED=\(.rated // false) G_TC=\(.tc // "") G_DATE=\(.date // "") G_DATESTR=\(.date_str // "") G_OPENING=\(.opening // "") G_ECO=\(.eco // "") START_FEN=\(.start_fen // "") G_HASEVAL=\(.evals != null) G_ACC_W=\(.accuracy.white // "") G_ACC_B=\(.accuracy.black // "") G_SUM=\(if .summary then [.summary.white.accuracy, .summary.white.acpl, .summary.white.inaccuracy, .summary.white.mistake, .summary.white.blunder, .summary.black.accuracy, .summary.black.acpl, .summary.black.inaccuracy, .summary.black.mistake, .summary.black.blunder] | map(. // "-" | tostring) | join("|") else "" end)"' <<<"$json")"
+  mapfile -t SAN < <(jq -r '.moves[]' <<<"$json")
+  EVCP=() EVMATE=() BESTUCI=() GIVEN=()
+  if [[ $G_HASEVAL == true ]]; then
+    local i=1 cp m best j
+    while IFS='|' read -r cp m best j; do
+      if [[ -n $m ]]; then EVMATE[i]=$m; EVCP[i]=$((m > 0 ? 10000 : -10000)); else EVCP[i]=$cp EVMATE[i]=""; fi
+      BESTUCI[i - 1]=$best; GIVEN[i]=$j; ((i++))
+    done < <(jq -r '.evals[] | [.cp, .mate, .best, .judgment] | map(. // "" | tostring) | join("|")' <<<"$json")
+  fi
+}
+
+analyze_loaded() {
+  info "Replaying ${#SAN[@]} plies…"
+  replay
+  [[ -n $REPLAY_ERR ]] && warn "$REPLAY_ERR"
+  EVAL_SRC=""
+  # terminal position: fill in mate/stalemate if the source has no eval for it
+  if ((NPLY > 0)) && [[ -z ${EVCP[NPLY]} && -z ${EVMATE[NPLY]} ]]; then
+    load_fen "${FENS[NPLY]}"
+    if ! has_legal_move; then
+      local k=K opp=b; [[ $SIDE == b ]] && k=k opp=w
+      if find_king "$k" && is_attacked "$KSQ" "$opp"; then
+        EVMATE[NPLY]=0; [[ $SIDE == w ]] && EVCP[NPLY]=-10000 || EVCP[NPLY]=10000
+      else EVCP[NPLY]=0; fi
+    fi
+  fi
+  if [[ $G_HASEVAL == true ]] && ((${#EVCP[@]} > 0)); then
+    EVAL_SRC="Lichess server analysis"
+    classify 1
+  elif [[ -n $ENGINE && -x $ENGINE ]] && ((NPLY > 0)); then
+    if engine_analyze; then EVAL_SRC="Stockfish · depth $DEPTH (local)"; classify 0; fi
+  fi
+  if [[ -n $G_SUM ]]; then
+    IFS='|' read -r S_W_ACC S_W_ACPL S_W_INA S_W_MIS S_W_BLU S_B_ACC S_B_ACPL S_B_INA S_B_MIS S_B_BLU <<<"$G_SUM"
+  fi
+  [[ -t 2 ]] && printf '\r\e[K' >&2
+}
+
+print_review() {
+  local cols; cols=$(term_cols); local w=$((cols > 78 ? 74 : cols - 4))
+  local score
+  case $G_OUTCOME in
+    draw) score="½–½" ;;
+    win)  [[ $G_COLOR == white ]] && score="1–0" || score="0–1" ;;
+    loss) [[ $G_COLOR == white ]] && score="0–1" || score="1–0" ;;
+    *)    score="*" ;;
+  esac
+  local wn="$G_WHITE" bn="$G_BLACK" me="${BOLD}${CYAN}"
+  [[ $G_PLATFORM == pgn ]] && me=$BOLD
+  printf '\n  '
+  if [[ $G_COLOR == white ]]; then printf '%s○ %s%s' "$me" "$wn" "$R"; else printf '%s○ %s%s' "$BOLD" "$wn" "$R"; fi
+  printf ' %s%s%s' "$GREY" "${G_WELO:+($G_WELO)}" "$R"
+  printf '   %svs%s   ' "$DIM" "$R"
+  if [[ $G_COLOR == black ]]; then printf '%s● %s%s' "$me" "$bn" "$R"; else printf '%s● %s%s' "$BOLD" "$bn" "$R"; fi
+  printf ' %s%s%s\n' "$GREY" "${G_BELO:+($G_BELO)}" "$R"
+
+  local oc=$GREY word="Draw"
+  [[ $G_OUTCOME == win ]] && oc=$GREEN word="You won"
+  [[ $G_OUTCOME == loss ]] && oc=$RED word="You lost"
+  [[ $G_PLATFORM == pgn ]] && { oc=$YELLOW; word="Result"; }
+  printf '  %s%s%s %s' "$BOLD$YELLOW" "$score" "$R" "$oc$word$R"
+  [[ -n $G_TERM ]] && printf ' %sby %s%s' "$GREY" "$(term_word "$G_TERM")" "$R"
+  printf '\n  %s' "$GREY"
+  if [[ -n $G_DATE ]]; then printf '%(%a %d %b %Y, %H:%M)T' "$G_DATE"; elif [[ -n $G_DATESTR ]]; then printf '%s' "$G_DATESTR"; fi
+  [[ -n $G_TC ]] && printf ' · %s %s' "$G_TC" "$G_SPEED"
+  [[ $G_PLATFORM != pgn ]] && { [[ $G_RATED == true ]] && printf ' · rated' || printf ' · casual'; }
+  printf ' · %s%s\n' "$(platform_label "$G_PLATFORM")" "$R"
+  [[ -n $G_OPENING ]] && printf '  %s%s%s%s\n' "$ITAL" "${G_ECO:+$G_ECO }" "$G_OPENING" "$R"
+  printf '  '; rule "$w"
+
+  if [[ -z $EVAL_SRC ]]; then
+    printf '\n  %sNo evaluation data for this game.%s\n' "$YELLOW" "$R"
+    if [[ -n $G_ACC_W || -n $G_ACC_B ]]; then
+      printf '\n  %-26s %10s %10s\n' "" "○ White" "● Black"
+      printf '  %-26s %s%10s %10s%s\n' "Accuracy (Chess.com)" "$BOLD" "${G_ACC_W:--}" "${G_ACC_B:--}" "$R"
+    fi
+    printf '  %sInstall Stockfish for blunder / mistake detection:%s sudo apt install stockfish\n' "$DIM" "$R"
+  else
+    local wl bl
+    wl="○ ${G_WHITE:0:12}" bl="● ${G_BLACK:0:12}"
+    printf '\n  %sGAME REVIEW%s  %s%s%s\n\n' "$BOLD" "$R" "$DIM" "$EVAL_SRC" "$R"
+    local p1 p2; printf -v p1 '%*s' $((15 - ${#wl})) ''; printf -v p2 '%*s' $((15 - ${#bl})) ''
+    printf '  %-24s%s%s%s%s%s%s\n' "" "$p1" "$BOLD" "$wl" "$p2" "$bl" "$R"
+    printf '  %-24s %s%14s %14s%s\n' "Accuracy" "$BOLD" "${S_W_ACC:--}%" "${S_B_ACC:--}%" "$R"
+    if [[ $G_PLATFORM == chesscom && ( -n $G_ACC_W || -n $G_ACC_B ) ]]; then
+      printf '  %-24s %s%14s %14s%s\n' "Accuracy (Chess.com)" "$GREY" "${G_ACC_W:--}" "${G_ACC_B:--}" "$R"
+    fi
+    printf '  %-24s %14s %14s\n' "Avg. centipawn loss" "${S_W_ACPL:--}" "${S_B_ACPL:--}"
+    if [[ $EVAL_SRC == Stockfish* ]]; then
+      local i bw=0 bb=0
+      for ((i = 1; i <= NPLY; i++)); do
+        [[ -n ${BESTUCI[i - 1]} && ${UCI[i]} == "${BESTUCI[i - 1]}" ]] || continue
+        if [[ ${MOVER[i]} == w ]]; then ((bw++)); else ((bb++)); fi
+      done
+      printf '  %s★%s %-22s %s%14s %14s%s\n' "$GREEN" "$R" "Best moves" "$GREEN" "$bw" "$bb" "$R"
+    fi
+    printf '  %s?!%s %-21s %s%14s %14s%s\n' "$YELLOW" "$R" "Inaccuracies" "$YELLOW" "${S_W_INA:-0}" "${S_B_INA:-0}" "$R"
+    printf '  %s?%s  %-21s %s%14s %14s%s\n' "$ORANGE" "$R" "Mistakes" "$ORANGE" "${S_W_MIS:-0}" "${S_B_MIS:-0}" "$R"
+    printf '  %s??%s %-21s %s%14s %14s%s\n' "$RED" "$R" "Blunders" "$RED" "${S_W_BLU:-0}" "${S_B_BLU:-0}" "$R"
+
+    printf '\n  %sEval%s  %s%s%s\n' "$DIM" "$R" "$WHITE" "$GRAPH" "$R"
+
+    local shown=0 i
+    for ((i = 1; i <= NPLY; i++)); do
+      [[ ${JUDG[i]} == Mistake || ${JUDG[i]} == Blunder ]] || continue
+      if ((shown == 0)); then printf '\n  %sKEY MOMENTS%s\n' "$BOLD" "$R"; fi
+      ((shown++ >= 14)) && { printf '  %s… more in the move list%s\n' "$DIM" "$R"; break; }
+      judg_glyph "${JUDG[i]}"; move_label "$i"
+      fmt_eval "${EVCP[i - 1]}" "${EVMATE[i - 1]}"; local e0=$EVS
+      fmt_eval "${EVCP[i]}" "${EVMATE[i]}"; local e1=$EVS
+      local who="○"; [[ ${MOVER[i]} == b ]] && who="●"
+      padc "$ML" 6
+      printf '  %s %s%s%s %s%-9s%s %s%6s → %-6s%s' "$who" "$GREY" "$PADOUT" "$R" "$JC$BOLD" "${SAN[i - 1]}$JG" "$R" "$DIM" "$e0" "$e1" "$R"
+      if best_san "$i"; then printf ' %sbest%s %s%s%s' "$DIM" "$R" "$GREEN" "$BS" "$R"; fi
+      printf '\n'
+    done
+    ((shown == 0)) && printf '\n  %sNo mistakes or blunders — clean game!%s\n' "$GREEN" "$R"
+  fi
+  printf '\n  '; rule "$w"
+}
+
+print_move_list() {
+  local i e g c line note
+  printf '\n  %sMOVES%s  %s%s vs %s%s\n\n' "$BOLD" "$R" "$DIM" "$G_WHITE" "$G_BLACK" "$R"
+  local start=1
+  if ((NPLY > 0)) && [[ ${MOVER[1]} == b ]]; then
+    judg_glyph "${JUDG[1]}"; fmt_eval "${EVCP[1]}" "${EVMATE[1]}"
+    [[ -z $EVAL_SRC ]] && EVS=""
+    printf '  %s%4s%s  %-8s   %6s    %s%-10s%s %s%6s%s\n' "$GREY" "${MOVENO[1]}." "$R" "…" "" "$JC" "${SAN[0]}$JG" "$R" "$DIM" "$EVS" "$R"
+    start=2
+  fi
+  local notes=()
+  for ((i = start; i <= NPLY; i += 2)); do
+    printf '  %s%4s%s  ' "$GREY" "${MOVENO[i]}." "$R"
+    local k
+    for k in "$i" $((i + 1)); do
+      ((k > NPLY)) && break
+      judg_glyph "${JUDG[k]}"; fmt_eval "${EVCP[k]}" "${EVMATE[k]}"; [[ -z $EVAL_SRC ]] && EVS=""
+      printf '%s%-10s%s %s%6s%s    ' "$JC" "${SAN[k - 1]}$JG" "$R" "$DIM" "$EVS" "$R"
+      if [[ -n ${JUDG[k]} ]]; then
+        move_label "$k"; note="$JC${JUDG[k]}$R  $ML ${SAN[k - 1]}"
+        best_san "$k" && note+="  ${DIM}best$R $GREEN$BS$R"
+        notes+=("$note")
+      fi
+    done
+    printf '\n'
+    for note in "${notes[@]}"; do printf '        %s↳%s %s\n' "$GREY" "$R" "$note"; done
+    notes=()
+  done
+  [[ -n $EVAL_SRC ]] || printf '\n  %s(no evaluations — install stockfish for analysis)%s\n' "$DIM" "$R"
+  printf '\n'
+}
+
+# ─── step-through board viewer ──────────────────────────────────────────────
+glyph() { # piece char → GL
+  if [[ $PIECES == ascii ]]; then GL=${1^^}; return; fi
+  case ${1^^} in K) GL=♚;; Q) GL=♛;; R) GL=♜;; B) GL=♝;; N) GL=♞;; P) GL=♟;; esac
+}
+
+draw_frame() {
+  local i=$CUR rr ff rank file idx p sq bg fg cell line hl_from=-1 hl_to=-1
+  [[ -n ${LASTMV[i]} ]] && read -r hl_from hl_to <<<"${LASTMV[i]}"
+  local -a L P
+  # eval bar (white share from the bottom, from white's perspective)
+  local wv=50 have_ev=0
+  if [[ -n $EVAL_SRC && -n ${EVCP[i]} ]]; then
+    have_ev=1; local c=${EVCP[i]}; ((c > 1000)) && c=1000; ((c < -1000)) && c=-1000
+    wv=$((50 + c * 45 / 1000)); [[ -n ${EVMATE[i]} ]] && { ((EVCP[i] > 0)) && wv=100 || wv=0; }
+  fi
+  local wrows=$(((wv * 8 + 50) / 100))
+  L+=("")
+  for ((rr = 0; rr < 8; rr++)); do
+    if ((FLIP)); then rank=$rr; else rank=$((7 - rr)); fi
+    line="  $GREY$((rank + 1))$R "
+    for ((ff = 0; ff < 8; ff++)); do
+      if ((FLIP)); then file=$((7 - ff)); else file=$ff; fi
+      idx=$(((7 - rank) * 8 + file)); p=${POS[i]:idx:1}; sq=$((rank * 16 + file))
+      if (((rank + file) % 2)); then bg=180; ((sq == hl_from || sq == hl_to)) && bg=186
+      else bg=137; ((sq == hl_from || sq == hl_to)) && bg=143; fi
+      if [[ $p == . ]]; then cell="   "
+      else
+        glyph "$p"
+        if [[ $p == [A-Z] ]]; then fg=$'\e[1;38;5;231m'; else fg=$'\e[38;5;16m'; fi
+        cell=" $fg$GL "
+      fi
+      line+=$'\e[48;5;'"${bg}m$cell$R"
+    done
+    if ((have_ev)); then
+      local filled
+      if ((FLIP)); then filled=$((rr < wrows)); else filled=$((7 - rr < wrows)); fi
+      if ((filled)); then line+=" "$'\e[48;5;255m'"  $R"; else line+=" "$'\e[48;5;238m'"  $R"; fi
+    fi
+    L+=("$line")
+  done
+  if ((FLIP)); then line="    h  g  f  e  d  c  b  a"; else line="    a  b  c  d  e  f  g  h"; fi
+  L+=("$GREY$line$R")
+
+  # side panel
+  P+=("$BOLD○ ${G_WHITE}$R $GREY${G_WELO:+($G_WELO)}$R")
+  P+=("$BOLD● ${G_BLACK}$R $GREY${G_BELO:+($G_BELO)}$R")
+  P+=("")
+  if ((i == 0)); then
+    P+=("${DIM}Starting position$R")
+    P+=("")
+  else
+    judg_glyph "${JUDG[i]}"; move_label "$i"
+    local jw=""; [[ -n ${JUDG[i]} ]] && jw="  $JC${JUDG[i]}$R"
+    P+=("$GREY$ML$R $BOLD$JC${SAN[i - 1]}$JG$R$jw")
+    if [[ -n $EVAL_SRC ]]; then
+      fmt_eval "${EVCP[i]}" "${EVMATE[i]}"; local now=$EVS
+      fmt_eval "${EVCP[i - 1]}" "${EVMATE[i - 1]}"
+      if [[ ${EVMATE[i]} == 0 ]]; then P+=("$BOLD${RED}checkmate$R")
+      else P+=("${DIM}eval$R $BOLD$now$R ${DIM}(was $EVS)$R"); fi
+    else P+=(""); fi
+  fi
+  if [[ -n $EVAL_SRC && -n ${JUDG[i]} ]] && ((i > 0)) && best_san "$i"; then
+    P+=("${DIM}best$R $GREEN$BS$R")
+  else P+=(""); fi
+  P+=("$DIM$((i))/$NPLY$R")
+  P+=("")
+  # move window
+  local first=$(( i - 6 )); ((first < 1)) && first=1
+  ((first % 2 == 0)) && [[ ${MOVER[1]} == w ]] && ((first--))
+  ((first % 2 == 1)) && [[ ${MOVER[1]} == b ]] && ((first > 1)) && ((first--))
+  local k rowstr cnt=0
+  k=$first
+  while ((k <= NPLY && cnt < 6)); do
+    rowstr="$GREY$(printf '%4s' "${MOVENO[k]}.")$R "
+    if [[ ${MOVER[k]} == b ]]; then rowstr+="…        "; fi
+    local kk
+    for kk in "$k" $((k + 1)); do
+      ((kk > NPLY)) && break
+      [[ $kk != "$k" && ${MOVER[kk]} == w ]] && break
+      judg_glyph "${JUDG[kk]}"
+      local t="${SAN[kk - 1]}$JG"; printf -v t '%-8s' "$t"
+      if ((kk == i)); then rowstr+="$REV$JC$t$R "; else rowstr+="$JC$t$R "; fi
+      k=$((kk + 1))
+    done
+    P+=("$rowstr"); ((cnt++))
+  done
+
+  # compose
+  local rows=$(( ${#L[@]} > ${#P[@]} ? ${#L[@]} : ${#P[@]} )) r out=$'\e[H'
+  local bw=$((4 + 24 + (have_ev ? 3 : 0)))
+  for ((r = 0; r < rows; r++)); do
+    local left=${L[r]:-}
+    out+="$left"
+    # pad to board width: board lines have fixed visible width
+    if ((r == 0 || r > 9)) || [[ -z $left ]]; then printf -v pad '%*s' "$bw" ''; out+="$pad"
+    elif ((r == 9)); then printf -v pad '%*s' $((bw - 26)) ''; out+="$pad"; fi
+    out+="    ${P[r]:-}"$'\e[K\n'
+  done
+  out+=$'\e[K\n'"  $DIM←/h prev  →/l next  ↑/g start  ↓/G end  n/N next/prev mistake  f flip  q back$R"$'\e[K\e[J'
+  printf '%s' "$out"
+}
+
+viewer() {
+  local key rest
+  CUR=0; FLIP=0; [[ $G_COLOR == black && $G_PLATFORM != pgn ]] && FLIP=1
+  printf '\e[?1049h\e[?25l\e[2J'
+  trap 'printf "\e[?25h\e[?1049l"' EXIT
+  trap 'printf "\e[2J"' WINCH
+  while true; do
+    draw_frame
+    IFS= read -rsn1 key </dev/tty || break
+    if [[ $key == $'\e' ]]; then
+      IFS= read -rsn2 -t 0.02 rest </dev/tty; key+=$rest
+      [[ $rest == '[1' || $rest == '[4' ]] && IFS= read -rsn1 -t 0.02 rest </dev/tty
+    fi
+    case $key in
+      $'\e[C'|l|' '|'') ((CUR < NPLY)) && ((CUR++)) ;;
+      $'\e[D'|h)        ((CUR > 0)) && ((CUR--)) ;;
+      $'\e[A'|$'\e[H'|$'\e[1'|g|0) CUR=0 ;;
+      $'\e[B'|$'\e[F'|$'\e[4'|G|e) CUR=$NPLY ;;
+      n) local j; for ((j = CUR + 1; j <= NPLY; j++)); do [[ -n ${JUDG[j]} ]] && { CUR=$j; break; }; done ;;
+      N|p) local j; for ((j = CUR - 1; j >= 1; j--)); do [[ -n ${JUDG[j]} ]] && { CUR=$j; break; }; done ;;
+      f) FLIP=$((!FLIP)); printf '\e[2J' ;;
+      q|Q|$'\e') break ;;
+    esac
+  done
+  printf '\e[?25h\e[?1049l'
+  trap - EXIT WINCH
+}
+
+# review menu → returns 0 = back to list, 1 = quit
+review_menu() {
+  local key
+  while true; do
+    printf '  %ss%s step through   %sm%s move list   %so%s open in browser   %sb%s back   %sq%s quit ' \
+      "$BOLD$CYAN" "$R" "$BOLD$CYAN" "$R" "$BOLD$CYAN" "$R" "$BOLD$CYAN" "$R" "$BOLD$CYAN" "$R"
+    IFS= read -rsn1 key </dev/tty || return 1
+    printf '\r\e[K'
+    case $key in
+      s|S|'') viewer; clear; print_review ;;
+      m|M) if command -v less >/dev/null; then print_move_list | less -R; else print_move_list; fi ;;
+      o|O) if [[ -n $G_URL ]]; then
+             { command -v xdg-open >/dev/null && xdg-open "$G_URL" >/dev/null 2>&1 & } || true
+             printf '  %s%s%s\n' "$BLUE" "$G_URL" "$R"
+           else printf '  %sNo URL for this game.%s\n' "$DIM" "$R"; fi ;;
+      b|B|$'\e') return 0 ;;
+      q|Q) return 1 ;;
+    esac
+  done
+}
+
+review_game() { # file idx
+  load_game "$1" "$2"
+  analyze_loaded
+  clear
+  print_review
+  review_menu
+}
+
+# ─── commands ───────────────────────────────────────────────────────────────
+cmd_analyze() {
+  need curl jq fzf
+  load_config
+  if [[ -z $PLATFORM || -z $USERNAME ]]; then
+    warn "No account configured yet — let's set one up."
+    cmd_user || exit 1
+    load_config
+  fi
+  local n=${1:-$NGAMES}
+  [[ $n =~ ^[0-9]+$ ]] && ((n > 0)) || die "Game count must be a positive number."
+  ((n > 300)) && n=300
+  mkdir -p "$CACHE_DIR"
+  local file="$CACHE_DIR/games-$PLATFORM-${USERNAME,,}.jsonl"
+  info "Fetching last $n games for $BOLD$USERNAME$R on $(platform_label "$PLATFORM")…"
+  case $PLATFORM in
+    lichess)  fetch_lichess "$USERNAME" "$n" "$file" ;;
+    chesscom) fetch_chesscom "$USERNAME" "$n" "$file" ;;
+    *) die "Unknown platform in config: $PLATFORM (run chess -u)" ;;
+  esac
+  local count; count=$(wc -l <"$file")
+  ((count > 0)) || die "No standard games found for $USERNAME."
+  ok "$count games loaded"
+  [[ -z $ENGINE && $PLATFORM == chesscom ]] && warn "Stockfish not found — Chess.com games will show moves only. (sudo apt install stockfish)"
+  pick_loop "$file"
+}
+
+pick_loop() {
+  local file=$1 sel idx cols list
+  while true; do
+    cols=$(term_cols)
+    list=$(list_lines "$file" "$cols")
+    sel=$(fzf --ansi --delimiter=$'\t' --with-nth=2 --no-sort --layout=reverse --height=100% \
+          --border=rounded --border-label=" ♞ $USERNAME · $(platform_label "$PLATFORM") " \
+          --header="$(list_header)" --header-first --prompt='  search ❯ ' --pointer='▶' \
+          --info=inline-right --color='header:dim,label:bold,pointer:117,prompt:117' \
+          --preview="$(printf '%q' "$SELF") --_preview {1} $(printf '%q' "$file")" \
+          --preview-window='down,45%,border-top,wrap,hidden' \
+          --bind='ctrl-p:toggle-preview,?:toggle-preview' \
+          --footer="  enter review · ? preview · esc quit" 2>/dev/null <<<"$list") ||
+      { # older fzf without --footer
+        [[ $? == 2 ]] && sel=$(fzf --ansi --delimiter=$'\t' --with-nth=2 --no-sort --layout=reverse --height=100% \
+          --border --header="$(list_header)" --prompt='  search ❯ ' \
+          --preview="$(printf '%q' "$SELF") --_preview {1} $(printf '%q' "$file")" \
+          --preview-window='down,45%,wrap,hidden' --bind='ctrl-p:toggle-preview,?:toggle-preview' <<<"$list")
+      }
+    [[ -z $sel ]] && break
+    idx=${sel%%$'\t'*}
+    review_game "$file" "$idx" || break
+  done
+}
+
+cmd_file() { # review a local PGN
+  need jq
+  load_config
+  [[ -f $1 ]] || die "No such file: $1"
+  mkdir -p "$CACHE_DIR"
+  local file="$CACHE_DIR/pgnfile.jsonl"
+  jq -Rsc "$JQ_LIB $JQ_PGNFILE" "$1" >"$file" || die "Couldn't parse PGN."
+  G_ID=""
+  local key
+  while true; do review_game "$file" 1 || break; done
+}
+
+usage() {
+  cat <<EOF
+
+  ${BOLD}♞ chess${R} ${DIM}$VERSION — game review for Chess.com & Lichess in your terminal${R}
+
+  ${BOLD}USAGE${R}
+    chess -u [platform] [username]   set up / change your account
+    chess -a [N]                     browse & review your last N games (default ${NGAMES:-30})
+    chess -f game.pgn                review a local PGN file
+    chess -c                         show configuration
+    chess --clear-cache              delete cached games & engine evaluations
+    chess -h | -v                    help | version
+
+  ${BOLD}EXAMPLES${R}
+    chess -u                         interactive setup
+    chess -u lichess DrNykterstein
+    chess -u chess.com:hikaru
+    chess -a 50
+
+  ${BOLD}IN THE GAME LIST${R}   type to filter · enter review · ? preview · esc quit
+  ${BOLD}IN A REVIEW${R}        s step through board · m move list · o open in browser · b back
+  ${BOLD}ON THE BOARD${R}       ←/→ move · ↑/↓ start/end · n/N next/prev mistake · f flip · q back
+
+  ${BOLD}ANALYSIS${R}
+    Lichess games that were analysed on lichess.org use the server's evaluations.
+    Everything else is analysed locally with Stockfish if it's installed
+    (sudo apt install stockfish). Settings live in ${DIM}$CONFIG_FILE${R}
+    (games, depth, threads, pieces=unicode|ascii, engine=/path/to/stockfish).
+
+EOF
+}
+
+main() {
+  case ${1:-} in
+    -u|--user|--setup)  shift; cmd_user "$@" ;;
+    -a|--analyze|--analyse) shift; cmd_analyze "$@" ;;
+    -f|--file)          shift; [[ -n ${1:-} ]] || die "Usage: chess -f game.pgn"; cmd_file "$1" ;;
+    -c|--config)        cmd_config ;;
+    -v|--version)       printf 'chess %s\n' "$VERSION" ;;
+    --clear-cache)      rm -rf "$CACHE_DIR"; ok "Cache cleared." ;;
+    --_preview)         shift; CHESS_FORCE_COLOR=1; setup_colors; cmd_preview "$@" ;;
+    -h|--help|'')       load_config; usage ;;
+    *)                  msg "Unknown option: $1"; load_config; usage; exit 2 ;;
+  esac
+}
+
+# allow sourcing for tests
+[[ ${BASH_SOURCE[0]} == "$0" ]] && main "$@"
