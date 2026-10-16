@@ -1,14 +1,11 @@
-$$
-\colorbox{#1a1a1a}{
-\begin{aligned}
-&\color{#ffffff}{\texttt{________  __________________       __________________________  __}} \\
-&\color{#ffffff}{\texttt{  / ____/ / / / ____/ ___/ ___/      / ____/ ____/\_  __/ ____/ / / /}} \\
-&\color{#ffffff}{\texttt{ / /   / /\_/ / \_\_/  \textbackslash\_\_ \textbackslash\textbackslash\_\_ \textbackslash\______/ /\_  / \_\_/   / / / /   / /\_/ / }} \\
-&\color{#ffffff}{\texttt{/ /\_ \_\_/ \_\_  / /\_ \_\_ \_\_\_/ / \_\_/ /\_\_\_\_\_/ \_\_/ / /\_ \_\_  / / / /\_ \_\_/ \_\_  /  }} \\
-&\color{#ffffff}{\texttt{\textbackslash\_\_\_\_/\_/\_ /\_/\_\_\_\_\_//\_\_\_\_/\_\_\_\_/     /\_/   /\_\_\_\_\_/ /\_/  \textbackslash\_\_\_\_/\_/\_ /\_/}}
-\end{aligned}
-}
-$$
+<pre style="background: #0d1117; color: #58a6ff; padding: 20px; border-radius: 6px; font-weight: bold; overflow-x: auto; border: 1px solid #30363d;">
+   ______ __  __ ______ _____ _____         ______ ______ _______ _____ _    _ 
+  / ____// / / // ____// ___// ___/  ____  / ____// ____//__  __// ____// / / /
+ / /    / /_/ // __/   \__ \ \__ \  /___/ / /_   / __/     / /  / /    / /_/ / 
+/ /___ / __  // /___  ___/ /___/ /       / __/  / /___    / /  / /___ / __  /  
+\____//_/ /_//_____/ /____//____/       /_/    /_____/   /_/   \____//_/ /_/   
+</pre>
+
 
 # ♞ chess — game review in your terminal
 
