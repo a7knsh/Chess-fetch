@@ -1,11 +1,11 @@
 $$
 \colorbox{#1a1a1a}{
 \begin{aligned}
-&\color{#ff3333}{\texttt{________  __________________}}       &&\color{#ffffff}{\texttt{__________________________  __}} \\
-&\color{#ff3333}{\texttt{  / ____/ / / / ____/ ___/ ___/}}      &&\color{#ffffff}{\texttt{  / ____/ ____/\_  __/ ____/ / / /}} \\
-&\color{#ff3333}{\texttt{ / /   / /\_/ / \_\_/  \textbackslash\_\_ \textbackslash\textbackslash\_\_ \textbackslash\______}}&&\color{#ffffff}{\texttt{ / /\_  / \_\_/   / / / /   / /\_/ / }} \\
-&\color{#ff3333}{\texttt{/ /\_ \_\_/ \_\_  / /\_ \_\_ \_\_\_/ / \_\_/ / \_\_\_\_\_/}}&&\color{#ffffff}{\texttt{/ \_\_/ / /\_ \_\_  / / / /\_ \_\_/ \_\_  /  }} \\
-&\color{#ff3333}{\texttt{\textbackslash\_\_\_\_/\_/\_ /\_/\_\_\_\_\_//\_\_\_\_/\_\_\_\_/}}     &&\color{#ffffff}{\texttt{/\_/   /\_\_\_\_\_/ /\_/  \textbackslash\_\_\_\_/\_/\_ /\_/}}
+&\color{#ffffff}{\texttt{________  __________________       __________________________  __}} \\
+&\color{#ffffff}{\texttt{  / ____/ / / / ____/ ___/ ___/      / ____/ ____/\_  __/ ____/ / / /}} \\
+&\color{#ffffff}{\texttt{ / /   / /\_/ / \_\_/  \textbackslash\_\_ \textbackslash\textbackslash\_\_ \textbackslash\______/ /\_  / \_\_/   / / / /   / /\_/ / }} \\
+&\color{#ffffff}{\textttTarget{/ /\_ \_\_/ \_\_  / /\_ \_\_ \_\_\_/ / \_\_/ /\_\_\_\_\_/ \_\_/ / /\_ \_\_  / / / /\_ \_\_/ \_\_  /  }} \\
+&\color{#ffffff}{\texttt{\textbackslash\_\_\_\_/\_/\_ /\_/\_\_\_\_\_//\_\_\_\_/\_\_\_\_/     /\_/   /\_\_\_\_\_/ /\_/  \textbackslash\_\_\_\_/\_/\_ /\_/}}
 \end{aligned}
 }
 $$
